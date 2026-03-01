@@ -1,8 +1,31 @@
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, exit};
 
 const SKIP: &[&str] = &["TEMPLATE.md", ".git", ".archive", ".cache", ".gitignore", "config.json"];
+const MCP_BEGIN: &str = "# necto-mcp-begin";
+const MCP_END: &str = "# necto-mcp-end";
+
+#[derive(Debug, Deserialize)]
+struct McpServersFile {
+    #[serde(default, rename = "mcpServers")]
+    mcp_servers: serde_json::Value,
+    #[serde(default, rename = "_codexExtras")]
+    codex_extras: BTreeMap<String, CodexExtra>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexExtra {
+    url: String,
+}
+
+#[derive(Serialize)]
+struct OpenCodeMcp {
+    #[serde(rename = "mcpServers")]
+    mcp_servers: serde_json::Value,
+}
 
 fn home() -> PathBuf {
     std::env::var("HOME").map(PathBuf::from).expect("$HOME not set")
@@ -69,16 +92,94 @@ fn sync_skills(home: &Path, dry_run: bool) -> usize {
 }
 
 fn sync_mcp(home: &Path) {
-    let script = home.join("scripts/mcp-sync.py");
-    if !script.exists() {
-        eprintln!("⚠  MCP: ~/scripts/mcp-sync.py not found, skipping");
-        return;
+    let source = home.join("agent-config/mcp-servers.json");
+    let raw = match fs::read_to_string(&source) {
+        Ok(content) => content,
+        Err(_) => {
+            eprintln!("⚠  MCP: cannot read ~/agent-config/mcp-servers.json, skipping");
+            return;
+        }
+    };
+
+    let parsed: McpServersFile = match serde_json::from_str(&raw) {
+        Ok(data) => data,
+        Err(_) => {
+            eprintln!("⚠  MCP: invalid JSON in ~/agent-config/mcp-servers.json, skipping");
+            return;
+        }
+    };
+
+    let opencode_path = home.join(".opencode/mcp.json");
+    if let Some(parent) = opencode_path.parent() {
+        fs::create_dir_all(parent).ok();
     }
-    let status = Command::new("python3").arg(&script).arg("--apply").status();
-    match status {
-        Ok(s) if s.success() => println!("✓  MCP: synced"),
-        _ => eprintln!("⚠  MCP: sync failed"),
+    let opencode_body = OpenCodeMcp {
+        mcp_servers: parsed.mcp_servers.clone(),
+    };
+    match serde_json::to_string_pretty(&opencode_body) {
+        Ok(json) => {
+            if fs::write(&opencode_path, format!("{json}\n")).is_ok() {
+                println!("✓  MCP: wrote OpenCode config");
+            } else {
+                eprintln!("⚠  MCP: failed writing OpenCode config");
+            }
+        }
+        Err(_) => eprintln!("⚠  MCP: failed encoding OpenCode config"),
     }
+
+    let codex_path = home.join(".codex/config.toml");
+    if let Some(parent) = codex_path.parent() {
+        fs::create_dir_all(parent).ok();
+    }
+    let existing = fs::read_to_string(&codex_path).unwrap_or_default();
+    let managed_block = build_codex_mcp_block(&parsed.codex_extras);
+    let updated = match replace_or_append_managed_block(&existing, &managed_block) {
+        Ok(content) => content,
+        Err(msg) => {
+            eprintln!("⚠  MCP: {}", msg);
+            return;
+        }
+    };
+    if fs::write(&codex_path, updated).is_ok() {
+        println!("✓  MCP: wrote Codex config block");
+    } else {
+        eprintln!("⚠  MCP: failed writing Codex config");
+    }
+}
+
+fn build_codex_mcp_block(codex_extras: &BTreeMap<String, CodexExtra>) -> String {
+    let mut out = String::new();
+    out.push_str(MCP_BEGIN);
+    out.push('\n');
+    for (name, extra) in codex_extras {
+        out.push_str(&format!("[mcp_servers.{}]\n", name));
+        let url = serde_json::to_string(&extra.url).unwrap_or_else(|_| "\"\"".to_string());
+        out.push_str(&format!("url = {}\n", url));
+    }
+    out.push_str(MCP_END);
+    out.push('\n');
+    out
+}
+
+fn replace_or_append_managed_block(existing: &str, block: &str) -> Result<String, &'static str> {
+    if let Some(start) = existing.find(MCP_BEGIN) {
+        if let Some(end_rel) = existing[start..].find(MCP_END) {
+            let end = start + end_rel + MCP_END.len();
+            let mut out = String::new();
+            out.push_str(&existing[..start]);
+            out.push_str(block);
+            out.push_str(&existing[end..]);
+            return Ok(out);
+        }
+        return Err("found '# necto-mcp-begin' without matching '# necto-mcp-end'; leaving Codex config unchanged");
+    }
+
+    let mut out = existing.to_string();
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(block);
+    Ok(out)
 }
 
 fn sync_ce(home: &Path) {
@@ -87,13 +188,27 @@ fn sync_ce(home: &Path) {
         eprintln!("⚠  CE: every-marketplace not installed, skipping");
         return;
     }
-    let status = Command::new("bunx")
-        .args(["@every-env/compound-plugin", "install", "compound-engineering", "--to", "codex"])
-        .current_dir(&ce_dir)
-        .status();
-    match status {
-        Ok(s) if s.success() => println!("✓  CE: compound-engineering installed to Codex"),
-        _ => eprintln!("⚠  CE: install failed"),
+
+    for target in ["codex", "opencode", "gemini"] {
+        let status = Command::new("bunx")
+            .args([
+                "@every-env/compound-plugin",
+                "install",
+                "compound-engineering",
+                "--to",
+                target,
+            ])
+            .current_dir(&ce_dir)
+            .status();
+        match status {
+            Ok(s) if s.success() => {
+                println!("✓  CE: compound-engineering installed to {}", target)
+            }
+            _ => eprintln!(
+                "⚠  CE: compound-engineering install failed for {}, continuing",
+                target
+            ),
+        }
     }
 }
 
@@ -101,7 +216,7 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     if args.iter().any(|a| a == "--help" || a == "-h") {
-        println!("Usage: agent-sync [--full] [--check]");
+        println!("Usage: necto [--full] [--check]");
         println!();
         println!("  (default)  Sync skills symlinks (fast, safe for git hooks)");
         println!("  --full     Skills + MCP + compound-engineering");
