@@ -1,7 +1,12 @@
 [package]
 name = "necto"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
+description = "Sync AI coding tool config across Claude Code, OpenCode, Codex, and Gemini CLI — skills, MCP, and compound-engineering from a single source of truth"
+license = "MIT"
+repository = "https://github.com/terry-li-hm/necto"
+keywords = ["cli", "ai", "sync", "mcp", "claude"]
+categories = ["command-line-utilities", "development-tools"]
 
 [[bin]]
 name = "necto"
